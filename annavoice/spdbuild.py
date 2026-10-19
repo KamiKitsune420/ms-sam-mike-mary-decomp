@@ -14,8 +14,11 @@ resulting phone segments, and stage `build` trains the codebooks and writes the 
   python spdbuild.py build   [--corpus DIR] --sam Sam.spd --out Anna.spd
 """
 import argparse
+import math
 import os
+import shutil
 import sys
+import tempfile
 import time
 
 import numpy as np
@@ -386,6 +389,242 @@ def stage_analyze(args):
     print("wrote %s/frames.npz" % args.corpus)
 
 
+def load_wav(path):
+    """Read mono or multichannel audio and resample it to the analysis rate."""
+    from scipy.io import wavfile
+    from scipy.signal import resample_poly
+
+    rate, audio = wavfile.read(path)
+    if rate <= 0 or len(audio) == 0:
+        raise ValueError("WAV must have a positive sample rate and contain audio")
+    if np.issubdtype(audio.dtype, np.integer):
+        info = np.iinfo(audio.dtype)
+        if info.min == 0:
+            midpoint = float(info.max + 1) / 2.0
+            audio = (audio.astype(np.float64) - midpoint) / midpoint
+        else:
+            scale = float(max(abs(info.min), abs(info.max)))
+            audio = audio.astype(np.float64) / scale
+    else:
+        audio = audio.astype(np.float64)
+    if audio.ndim == 2:
+        audio = audio.mean(axis=1)
+    elif audio.ndim != 1:
+        raise ValueError("WAV must contain mono or multichannel PCM audio")
+    if not np.all(np.isfinite(audio)):
+        raise ValueError("WAV contains non-finite samples")
+    if rate != RATE:
+        divisor = math.gcd(int(rate), RATE)
+        audio = resample_poly(audio, RATE // divisor, int(rate) // divisor)
+    return np.asarray(audio, dtype=np.float64)
+
+
+def parse_htk_lab(path, nsamples, rate=RATE):
+    """Read phone-level HTK labels; timestamps use HTK 100 ns units."""
+    labels = []
+    previous_end = 0
+    silence = {"SIL", "SP", "PAU", "H#", "BOUNDARY"}
+    with open(path, encoding="utf-8-sig") as lab:
+        lines = enumerate(lab, 1)
+        for line_no, line in lines:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            fields = line.split()
+            if len(fields) < 3:
+                raise ValueError("lab line %d must have start, end, and phone label" % line_no)
+            try:
+                start, end = int(fields[0]), int(fields[1])
+            except ValueError:
+                raise ValueError("lab line %d has non-integer HTK timestamps" % line_no)
+            if start < 0 or end <= start or start < previous_end:
+                raise ValueError("lab line %d has invalid or overlapping timestamps" % line_no)
+            a = int(round(start * rate / 10_000_000))
+            b = min(nsamples, int(round(end * rate / 10_000_000)))
+            if a >= nsamples:
+                raise ValueError("lab line %d starts after the end of the WAV" % line_no)
+            label = fields[2].upper()
+            lower_label = label.lower()
+            if label in silence:
+                targets = ["SIL"]
+            else:
+                targets = [label]
+                if lower_label[-1:] in ("0", "1", "2") and lower_label[:-1] in VOW:
+                    targets = [VOW[lower_label[:-1]] + ("1" if lower_label[-1] in ("1", "2") else "0")]
+                elif lower_label in VOW:
+                    targets = [VOW[lower_label] + "0", VOW[lower_label] + "1"]
+            labels.append((a, b, label, targets))
+            previous_end = end
+    if not labels:
+        raise ValueError("lab file contains no phone labels")
+    return labels
+
+
+def estimate_period(audio, center, min_period=40, max_period=320):
+    """Estimate a voiced pitch period by the strongest normalized autocorrelation peak."""
+    half = 300
+    start, end = max(0, center - half), min(len(audio), center + half)
+    frame = audio[start:end]
+    if len(frame) < 2 * min_period or np.dot(frame, frame) < 1e-7:
+        return None
+    frame = frame - np.mean(frame)
+    nfft = 1 << (2 * len(frame) - 1).bit_length()
+    ac = np.fft.irfft(np.abs(np.fft.rfft(frame, nfft)) ** 2, nfft)[:max_period + 1]
+    lags = np.arange(min_period, min(max_period + 1, len(ac)))
+    normalized = ac[lags] / np.maximum(len(frame) - lags, 1)
+    normalized /= max(ac[0] / len(frame), 1e-12)
+    peaks = np.flatnonzero((normalized[1:-1] >= normalized[:-2]) &
+                           (normalized[1:-1] > normalized[2:])) + 1
+    if not len(peaks):
+        return None
+    peaks = peaks[normalized[peaks] >= 0.3]
+    return int(lags[peaks[0]]) if len(peaks) else None
+
+
+def make_pitch_epochs(audio):
+    """Create signed pitch-period lengths from a recording (negative marks unvoiced frames)."""
+    periods = []
+    position = 0
+    while position < len(audio):
+        center = position + 200
+        period = estimate_period(audio, center)
+        if period is None:
+            period = min(80, len(audio) - position)
+            signed = -period
+        else:
+            period = min(period, len(audio) - position)
+            signed = period
+        if period < 16:
+            break
+        periods.append(signed)
+        position += period
+    return np.asarray(periods, dtype=np.int16)
+
+
+class WaveRecording:
+    def __init__(self, audio, epochs):
+        self._audio = audio
+        self._epochs = epochs
+        self.marks = np.concatenate([[0], np.cumsum(np.abs(epochs))])
+
+    def audio(self, _index):
+        return self._audio
+
+    def epochs(self, _index):
+        return self._epochs
+
+
+def stage_wav(args):
+    """Build a complete Sam-format voice from a WAV and phone-level HTK lab."""
+    if args.per_unit < 1 or args.max_frames < 3:
+        raise ValueError("--per-unit must be positive and --max-frames must be at least 3")
+    audio = load_wav(args.wav)
+    labels = parse_htk_lab(args.lab, len(audio))
+    tab, names, nunits, _ = load_leaf_table(args.leaf_table)
+    pid = {name: i for i, name in enumerate(names)}
+    if "SIL" not in pid:
+        raise ValueError("the template Sam voice has no SIL phone")
+    for _, _, label, targets in labels:
+        missing = [target for target in targets if target not in pid]
+        if missing:
+            raise ValueError("lab phone %r maps to phone(s) missing from the Sam voice: %s" %
+                             (label, ", ".join(missing)))
+
+    epochs = make_pitch_epochs(audio)
+    recording = WaveRecording(audio, epochs)
+    lag = np.exp(-0.5 * (2 * np.pi * 60.0 / RATE * np.arange(21)) ** 2)
+    candidates, fallback = {}, {}
+    analysis_cache = {}
+
+    def analyze(instance, start, end):
+        key = (instance, start, end)
+        if key not in analysis_cache:
+            analysis_cache[key] = analyse_instance(recording, instance, start, end, lag, args.max_frames)
+        return analysis_cache[key]
+
+    for i, (_, _, _, targets) in enumerate(labels):
+        left_label = labels[i - 1][3][0] if i else "SIL"
+        right_label = labels[i + 1][3][0] if i + 1 < len(labels) else "SIL"
+        left = pid[left_label] if left_label in pid else pid["SIL"]
+        right = pid[right_label] if right_label in pid else pid["SIL"]
+        a, b, _, phones = labels[i]
+        if b - a < 160:
+            continue
+        for phone in phones:
+            phone_id = pid[phone]
+            fallback.setdefault(phone, []).append((i, a, b))
+            for position in range(4):
+                uid = int(tab[phone_id, left, right, position])
+                if uid >= 0:
+                    candidates.setdefault(uid, []).append((i, a, b))
+
+    frames, durations = {}, {}
+    for uid, pool in candidates.items():
+        lengths = np.array([b - a for _, a, b in pool])
+        rank = np.argsort(np.abs(lengths - np.median(lengths)))
+        got, selected_lengths = [], []
+        for index in rank[:args.per_unit * 3]:
+            instance, start, end = pool[int(index)]
+            result = analyze(instance, start, end)
+            if result and len(result) >= 3:
+                got.append(result)
+                selected_lengths.append(end - start)
+            if len(got) >= args.per_unit:
+                break
+        if got:
+            frames[uid] = average_instances(got) if len(got) > 1 else got[0]
+            durations[uid] = float(np.median(selected_lengths)) / 16.0
+
+    fallback_frames = {}
+    for phone, pool in fallback.items():
+        lengths = np.array([end - start for _, start, end in pool])
+        rank = np.argsort(np.abs(lengths - np.median(lengths)))
+        got = []
+        for index in rank:
+            instance, start, end = pool[int(index)]
+            result = analyze(instance, start, end)
+            if result and len(result) >= 3:
+                got.append(result)
+            if len(got) >= args.per_unit:
+                break
+        if got:
+            fallback_frames[phone] = average_instances(got) if len(got) > 1 else got[0]
+
+    for uid in range(nunits):
+        if uid not in frames:
+            phone = unit_phone(uid, tab, names)
+            if phone in fallback_frames:
+                frames[uid] = fallback_frames[phone]
+
+    empty = [uid for uid in range(nunits) if uid not in frames]
+    for uid in empty:
+        phone = unit_phone(uid, tab, names)
+        matching = [source for source in frames if unit_phone(source, tab, names) == phone]
+        source = min(matching, key=lambda source: abs(source - uid)) if matching else (
+            min(frames, key=lambda source: abs(source - uid)) if frames else None)
+        if source is not None:
+            frames[uid] = frames[source]
+    if not frames:
+        raise ValueError("no usable phone instances were found in the WAV and lab file")
+    if not any(frame[4] is not None for sequence in frames.values() for frame in sequence):
+        raise ValueError("no voiced frames were found; the SPD builder needs voiced speech for excitation codebooks")
+    print("analysed %d of %d units; %d units use a borrowed frame sequence" %
+          (nunits - len(empty), nunits, len(empty)))
+
+    with tempfile.TemporaryDirectory(prefix="wav2spd-") as corpus:
+        shutil.copyfile(args.leaf_table, os.path.join(corpus, "samleaf.bin"))
+        uids = sorted(frames)
+        np.savez_compressed(os.path.join(corpus, "frames.npz"),
+                            uid=np.array(uids),
+                            data=np.array([frames[uid] for uid in uids], dtype=object),
+                            dur=np.array([durations.get(uid, 0.0) for uid in uids]),
+                            allow_pickle=True)
+        build_args = argparse.Namespace(
+            corpus=corpus, sam=args.sam, out=args.out, rate=args.rate, books=args.books,
+            keep_durations=args.keep_durations)
+        stage_build(build_args)
+
+
 def unit_phone(uid, tab, names):
     """which phone a Sam unit index belongs to (the table says which phone produced it)"""
     if not hasattr(unit_phone, "map"):
@@ -521,9 +760,12 @@ def analyse_instance(c, i, s0, s1, lag, max_frames, order=20):
     ep = c.epochs(i)
     if len(ep) == 0 or len(x) == 0:
         return None
-    marks = np.concatenate([[0], np.cumsum(np.abs(ep))])
+    marks = getattr(c, "marks", None)
+    if marks is None:
+        marks = np.concatenate([[0], np.cumsum(np.abs(ep))])
     out = []
-    for k in range(len(ep)):
+    first = max(0, int(np.searchsorted(marks, s0, side="right")) - 1)
+    for k in range(first, len(ep)):
         s, n = int(marks[k]), int(abs(ep[k]))
         if n < 16 or n > 800 or s < s0 or s + n > min(s1, len(x)):
             continue
@@ -727,11 +969,14 @@ def escape_periods(vals):
 
 
 def stage_build(args):
-    z = np.load(os.path.join(args.corpus, "frames.npz"), allow_pickle=True)
-    uids = list(z["uid"])
-    data = {int(u): d for u, d in zip(z["uid"], z["data"])}
+    with np.load(os.path.join(args.corpus, "frames.npz"), allow_pickle=True) as z:
+        uids = list(z["uid"])
+        frame_values = list(z["data"])
+        duration_values = np.asarray(z["dur"]).copy()
+    data = {int(u): d for u, d in zip(uids, frame_values)}
     tab, names, nunits, ubase = load_leaf_table(os.path.join(args.corpus, "samleaf.bin"))
-    sam = open(args.sam, "rb").read()
+    with open(args.sam, "rb") as f:
+        sam = f.read()
     import struct
     off3, sz3 = struct.unpack("<II", sam[0x18 + 24:0x18 + 32])
     old = sam[off3:off3 + sz3]
@@ -783,7 +1028,7 @@ def stage_build(args):
     units = []
     for uid in range(nunits):
         fr = data.get(uid)
-        if not fr:                                          # a unit her corpus never covered: near-silence
+        if fr is None or len(fr) == 0:                     # a unit her corpus never covered: near-silence
             fr = [(120, 0, np.linspace(0.02, 0.48, order).astype(np.float32), 1.0, None)]
         units.append(fr)
     flat = [f for fr in units for f in fr]
@@ -874,7 +1119,7 @@ def stage_build(args):
     #      sam_front.c reads base = float at leaf*16 in milliseconds)
     off1, sz1 = struct.unpack("<II", sam[0x18 + 8:0x18 + 16])
     sec1 = bytearray(sam[off1:off1 + sz1])
-    dur = {int(u): float(d) for u, d in zip(z["uid"], z["dur"]) if float(d) > 0}
+    dur = {int(u): float(d) for u, d in zip(uids, duration_values) if float(d) > 0}
     nph = len(names)
     changed = 0
     if not args.keep_durations:
@@ -906,7 +1151,8 @@ def stage_build(args):
         o, s = struct.unpack("<II", out[0x18 + 8 * i:0x20 + 8 * i])
         if i != 3 and o > off3:
             out[0x18 + 8 * i:0x1C + 8 * i] = struct.pack("<I", o + shift)
-    open(args.out, "wb").write(bytes(out))
+    with open(args.out, "wb") as f:
+        f.write(bytes(out))
     print("wrote %s (%.1f MB)" % (args.out, len(out) / 1e6))
 
 
@@ -931,8 +1177,23 @@ def main():
     c.add_argument("--books", choices=["sam", "fine"], default="sam")
     c.add_argument("--keep-durations", action="store_true", help="keep Sam's timings")
     c.set_defaults(func=stage_build)
+    w = sub.add_parser("wav", help="build a voice from a WAV and phone-level HTK lab")
+    w.add_argument("--wav", required=True)
+    w.add_argument("--lab", required=True, help="phone labels with HTK 100 ns timestamps")
+    w.add_argument("--leaf-table", required=True, help="samleaf.bin generated from the template SPD")
+    w.add_argument("--sam", required=True, help="template Sam-format SPD voice")
+    w.add_argument("--out", required=True)
+    w.add_argument("--rate", type=int, default=RATE)
+    w.add_argument("--books", choices=["sam", "fine"], default="sam")
+    w.add_argument("--per-unit", type=int, default=6)
+    w.add_argument("--max-frames", type=int, default=48)
+    w.add_argument("--keep-durations", action="store_true", help="keep template voice timings")
+    w.set_defaults(func=stage_wav)
     args = ap.parse_args()
-    args.func(args)
+    try:
+        args.func(args)
+    except (OSError, ValueError) as exc:
+        ap.error(str(exc))
 
 
 if __name__ == "__main__":

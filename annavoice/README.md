@@ -37,6 +37,25 @@ Then put `Anna.spd` next to `LTTS1033.LXA` and `r1033tts.LXA`, give it an `.sdf`
 build\x64\sam_say.exe --data voice --voice Anna --rate 16000 "Hello, my name is Anna." out.wav
 ```
 
+## Building from a WAV and HTK labels
+
+For a custom recording, supply a phone-level HTK `.lab` file alongside a WAV. Labels should use
+the template voice's ARPAbet phone names (for example `AA1`, `T`, `SIL`); unstressed vowel labels
+such as `AA` populate both stress variants, and `sil`, `sp`, `pau`, or `h#` are treated as `SIL`.
+HTK timestamps are integer 100 ns units, as in `0 5000000 HH`. Use a Sam-format template SPD to
+provide the phone set, trees, and unit layout:
+
+```
+build\x64\samleaf.exe Sam.spd samleaf.bin
+python annavoice\spdbuild.py wav --wav recording.wav --lab recording.lab ^
+  --leaf-table samleaf.bin --sam Sam.spd --out Custom.spd
+```
+
+The input audio is mixed to mono and resampled to 16 kHz for pitch-synchronous analysis. The builder
+estimates pitch periods from the waveform, trains fresh codebooks, and uses the HTK phone boundaries
+to select context-matched units and set their durations. Units not represented by the recording borrow
+another instance of the same phone when possible; limited phone coverage may reduce voice quality.
+
 ## How it works
 
 Sam's voice file is a pitch-synchronous LPC vocoder. Each of its 3365 units is a list of frames, and each

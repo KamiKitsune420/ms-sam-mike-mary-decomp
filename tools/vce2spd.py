@@ -14,8 +14,12 @@ Sections 0, 1 and 2 (phone set, per-leaf durations and amplitudes, the unit tree
 equivalent in the .vce - they are built from its Senone / TreeImage / PhoneFile streams - so they are
 taken from a donor .spd with the same unit count (Sam 3365; Mike, Mary and the rest 3333).
 
+`tools/spd2vce.py` reverses the Inventory/section-3 packing. Its output contains only the reconstructed
+Inventory stream: the other SAPI 4 streams cannot be recovered from an .spd.
+
   python tools/vce2spd.py freddy.vce Freddy.spd --donor Mike.spd
   python tools/vce2spd.py sam.vce out.spd --donor Sam.spd --verify Sam.spd
+  python tools/spd2vce.py Mike.spd Mike.vce
 
 Both files are Microsoft's voice data: the result is for your own machines.
 """

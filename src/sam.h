@@ -22,6 +22,14 @@ extern "C" {
 typedef struct sam_voice sam_voice;
 typedef struct sam_synth sam_synth;
 
+typedef enum {
+    SAM_VOCODER_RESIDUAL = 0, /* decoded voice residuals (original engine) */
+    SAM_VOCODER_PULSE = 1,    /* generated glottal pulses through the same LPC filters */
+    SAM_VOCODER_BIGVGAN = 2,  /* lightweight harmonic/residual source; not the neural BigVGAN model */
+    SAM_VOCODER_SPECTRAL = 3, /* additive partial synthesis; no time-domain LPC filtering */
+    SAM_VOCODER_BIGVGAN_CONCAT = 4 /* harmonic unit resynthesis; no LPC filtering */
+} sam_vocoder;
+
 /* One back-end segment, as produced by the engine's front end (the "segment record"). */
 typedef struct {
     int unit;                   /* unit index into the voice; 0 = silence */
@@ -50,6 +58,7 @@ typedef struct {
     float base_pitch;    /* the voice's base pitch in Hz, from its .sdf (Sam 100, Mike 110, Mary 189) */
     int whisper;         /* SAPI 4 Whisper: every frame gets noise excitation */
     int monotone;        /* SAPI 4 RoboSoft: every pitch point = the base pitch */
+    sam_vocoder vocoder; /* excitation engine; defaults to SAM_VOCODER_RESIDUAL */
 } sam_params;
 
 void sam_params_default(sam_params *p);

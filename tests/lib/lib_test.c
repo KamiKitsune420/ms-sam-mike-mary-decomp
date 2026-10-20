@@ -7,6 +7,7 @@
  * 3. word / sentence / bookmark events are in order, inside the text, and their audio positions
  *    never run past the audio that has been delivered
  * 4. two handles opened the same way render the same text identically
+ * 5. alternate vocoders can be selected and produce distinct audio from the same voice
  *
  * Note: one handle does not repeat itself exactly. The engine's accent prominences come from the CRT
  * rand(), whose state runs on from one Speak() to the next, as it does in the original spttseng.dll;
@@ -158,6 +159,63 @@ int main(int argc, char **argv)
         check(rc == 0 && d.samples == full && !memcmp(c.pcm, d.pcm, (size_t)full * sizeof *d.pcm),
               "a freshly opened handle renders the same text identically");
         check(d.nword == c.nword && d.nsent == c.nsent, "and reports the same events");
+
+        {
+            ctx pulse;
+            memset(&pulse, 0, sizeof pulse);
+            pulse.t = t2;
+            pulse.text = LONG_TEXT;
+            pulse.order_ok = pulse.span_ok = pulse.pos_ok = 1;
+            pulse.ncap = c.ncap;
+            pulse.pcm = malloc((size_t)pulse.ncap * sizeof *pulse.pcm);
+            check(pulse.pcm && sam_tts_set_vocoder(t2, "pulse") == 0,
+                  "the pulse vocoder can be selected on an open handle");
+            cb.user = &pulse;
+            rc = pulse.pcm ? sam_tts_speak(t2, LONG_TEXT, 0, &cb) : -1;
+            check(rc == 0 && pulse.pcm && pulse.samples == full &&
+                      memcmp(c.pcm, pulse.pcm, (size_t)full * sizeof *pulse.pcm) != 0,
+                  "the pulse vocoder renders existing voice data with distinct audio");
+            if (pulse.pcm) {
+                check(sam_tts_set_vocoder(t2, "bigvgan") == 0,
+                      "the BigVGAN-inspired vocoder can be selected on an open handle");
+                pulse.samples = 0;
+                memset(pulse.pcm, 0, (size_t)pulse.ncap * sizeof *pulse.pcm);
+                cb.user = &pulse;
+                rc = sam_tts_speak(t2, LONG_TEXT, 0, &cb);
+                check(rc == 0 && pulse.samples == full &&
+                          memcmp(c.pcm, pulse.pcm, (size_t)full * sizeof *pulse.pcm) != 0,
+                      "the BigVGAN-inspired vocoder renders existing voice data");
+                check(sam_tts_set_vocoder(t2, "spectral") == 0,
+                      "the additive spectral vocoder can be selected on an open handle");
+                pulse.samples = 0;
+                memset(pulse.pcm, 0, (size_t)pulse.ncap * sizeof *pulse.pcm);
+                cb.user = &pulse;
+                rc = sam_tts_speak(t2, LONG_TEXT, 0, &cb);
+                check(rc == 0 && pulse.samples == full &&
+                          memcmp(c.pcm, pulse.pcm, (size_t)full * sizeof *pulse.pcm) != 0,
+                      "the additive spectral vocoder renders existing voice data");
+                check(sam_tts_set_vocoder(t2, "bigvgan-concat") == 0,
+                      "the concatenative BigVGAN-inspired vocoder can be selected");
+                pulse.samples = 0;
+                memset(pulse.pcm, 0, (size_t)pulse.ncap * sizeof *pulse.pcm);
+                cb.user = &pulse;
+                rc = sam_tts_speak(t2, LONG_TEXT, 0, &cb);
+                check(rc == 0 && pulse.samples == full &&
+                          memcmp(c.pcm, pulse.pcm, (size_t)full * sizeof *pulse.pcm) != 0,
+                      "the concatenative BigVGAN-inspired vocoder renders existing voice data");
+            }
+            check(sam_tts_set_vocoder(t2, "unknown") == -1,
+                  "an unknown vocoder name is rejected");
+            rc = sam_tts_set_vocoder(t2, "residual");
+            d.samples = 0;
+            d.text = LONG_TEXT;
+            memset(d.pcm, 0, (size_t)d.ncap * sizeof *d.pcm);
+            cb.user = &d;
+            rc = rc == 0 && d.pcm ? sam_tts_speak(t2, LONG_TEXT, 0, &cb) : -1;
+            check(rc == 0 && d.samples == full && !memcmp(c.pcm, d.pcm, (size_t)full * sizeof *d.pcm),
+                  "switching back to residual restores the original audio");
+            free(pulse.pcm);
+        }
         free(d.pcm);
         sam_tts_close(t2);
     }

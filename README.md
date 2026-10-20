@@ -71,7 +71,48 @@ build\x64\sam_say.exe --data data\voice "Hello, my name is Microsoft Sam." out.w
 build\x64\sam_say.exe --data data\voice --voice Mike "Hello, I am Mike." out.wav      (Mike.spd + Mike.sdf)
 build\x64\sam_say.exe --data data\voice --voice Mary @story.txt out.wav              (read a UTF-8 file)
 build\x64\sam_say.exe --data data\voice --voice Mike --effect hall "Mike in Hall." out.wav
+build\x64\sam_say.exe --data data\voice --voice Mary --vocoder pulse "Mary in a new voice." out.wav
+build\x64\sam_say.exe --data data\voice --voice Sam --vocoder bigvgan "Sam with harmonic excitation." out.wav
+build\x64\sam_say.exe --data data\voice --voice Sam --vocoder spectral "Sam with additive synthesis." out.wav
+build\x64\sam_say.exe --data data\voice --voice Sam --vocoder bigvgan-concat "Sam with normalized units." out.wav
 ```
+
+### Swappable vocoder
+
+Every `.spd` voice can use `--vocoder residual` (the default, preserving the original
+residual-excitation LPC synthesis), `--vocoder pulse` (generated glottal pulses mixed with decoded
+voiced residuals), `--vocoder bigvgan` (a lightweight DSP approximation using a phase-continuous,
+band-limited harmonic source), or `--vocoder spectral` (additive synthesis with generated voiced
+harmonics and generated unvoiced noise). Spectral mode does not analyze or replay the original
+engine's decoded vowel or consonant excitation. It uses the stored formant envelope, pitch, and
+timing to shape its own harmonic source and generated broadband consonant noise. The noise uses
+frame level metadata, but not the original decoded consonant waveform; its nominal level is boosted
+by 12 dB to keep consonants audible. Short cosine fades soften voiced/unvoiced transitions and the
+harmonic carrier continues through consonant noise. A short sample-continuous correction smooths
+boundaries between acoustic units and silence. It does not run an LPC time-domain filter.
+The separate `--vocoder bigvgan-concat` mode is a lightweight BigVGAN-inspired concatenative
+renderer: it keeps the front end's selected units and frame timing, extracts harmonic magnitudes
+and phase directly from each selected voiced unit's decoded pulse spectrum, then synthesizes a
+phase-continuous, band-limited harmonic source without adding formant peaks or filtering with LPC.
+Unvoiced portions use their selected unit excitation directly. It normalizes each rendered speech
+unit to a common RMS target before peak control. It is DSP, not the BigVGAN neural model, and uses no
+pretrained weights.
+All modes use the same voice file, unit selection, pitch and duration contours. The `bigvgan` option
+directly synthesizes a phase-continuous harmonic waveform shaped by the voice's formant envelope,
+without applying the time-domain LPC filter. A gentle harmonic spectral tilt retains vowel
+brightness, while a conservative Nyquist margin and smooth harmonic taper reduce aliasing. It is
+inspired by neural vocoders' harmonic-rich, anti-aliased
+output, but is not the BigVGAN neural model and does not load its weights. The spectral mode uses
+the voice's stored LPC envelope as spectral data, but synthesizes by additive sinusoidal resynthesis
+rather than LPC filtering. Its partials stay below 96% of Nyquist (using the highest pitch during a
+transition) and receive a cosine roll-off over the upper 24% of Nyquist, retaining more upper
+harmonics while smoothly fading near the cutoff. Pitch and amplitude are interpolated across frames.
+Pitch phase is carried continuously across acoustic units to reduce aliasing and clicks at pitch and
+unit boundaries. Generated modes reduce
+peaks only when needed; gain reduction is smoothed across frames and segments to avoid audible level
+jumps. Library users can select `"residual"`, `"pulse"`, `"bigvgan"`, `"spectral"` or
+`"bigvgan-concat"` with
+`sam_tts_set_vocoder()`, or set `sam_params.vocoder` before creating a low-level synthesizer.
 
 ### SAPI 4 voice effects
 

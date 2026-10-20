@@ -43,6 +43,27 @@ struct sam_synth {
     float *mem;          /* LPC filter state [order+1] */
     int noise_pos;       /* voice +0x78 */
     int chunk_pos;       /* position inside the engine's output chunk */
+    double bigvgan_phase; /* continuous phase for the harmonic/residual vocoder */
+    double bigvgan_gain;  /* smoothed peak-control gain across frames and segments */
+    double concat_peak_gain;
+    double concat_f0;
+    int concat_f0_valid;
+    double concat_phase_offset[64];
+    unsigned char concat_phase_valid[64];
+    double spectral_gain; /* independent peak-control state for the additive vocoder */
+    double spectral_f0;
+    int spectral_f0_valid;
+    int spectral_harmonics;
+    int spectral_last_voiced;
+    int spectral_voicing_valid;
+    float spectral_last_sample;
+    int spectral_sample_valid;
+    double spectral_amplitude[64];
+    double spectral_noise_phase[128];
+    double spectral_noise_frequency[128];
+    double spectral_noise_amplitude[128];
+    unsigned char spectral_noise_valid;
+    unsigned spectral_noise_state;
     double svib_phase;   /* singing vibrato phase */
     /* vowel hold (singing): output samples -> source samples, piecewise linear */
     int w_on;
@@ -507,6 +528,7 @@ void sam_params_default(sam_params *p)
     p->whisper = 0;
     p->monotone = 0;
     p->no_reverse = 0;
+    p->vocoder = SAM_VOCODER_RESIDUAL;
 }
 
 sam_synth *sam_synth_new(const sam_voice *v, const sam_params *p)
@@ -521,6 +543,10 @@ sam_synth *sam_synth_new(const sam_voice *v, const sam_params *p)
         free(s);
         return NULL;
     }
+    s->bigvgan_gain = 1.0;
+    s->concat_peak_gain = 1.0;
+    s->spectral_gain = 1.0;
+    s->spectral_noise_state = 0x51f15e5du;
     return s;
 }
 
@@ -582,6 +608,394 @@ static void lpc_filter(sam_synth *s, const float *a, float *x, int n, float gain
         mem[0] = acc;
         x[k] = (float)((double)gain * acc);
     }
+}
+
+static double rosenberg_pulse(int i, int n)
+{
+    const double open = 0.62, phase = (double)i / n;
+    if (phase < open)
+        return 0.5 * 3.141592653589793 / open * sin(3.141592653589793 * phase / open);
+    return -0.5 * 3.141592653589793 / (1.0 - open) *
+           sin(3.141592653589793 * (phase - open) / (1.0 - open));
+}
+
+/* Blend a glottal pulse with the decoded residual to preserve its high-frequency detail. */
+static void pulse_excitation(float *x, int n)
+{
+    const double pulse_mix = 0.15;
+    double source_energy = 0.0, pulse_energy = 0.0, mixed_energy = 0.0;
+    int i;
+    for (i = 0; i < n; i++) source_energy += (double)x[i] * x[i];
+    for (i = 0; i < n; i++) {
+        double pulse = rosenberg_pulse(i, n);
+        pulse_energy += pulse * pulse;
+    }
+    if (source_energy > 0.0 && pulse_energy > 0.0) {
+        double pulse_scale = sqrt(source_energy / pulse_energy);
+        for (i = 0; i < n; i++) {
+            double mixed = (1.0 - pulse_mix) * x[i] + pulse_mix * pulse_scale * rosenberg_pulse(i, n);
+            x[i] = (float)mixed;
+            mixed_energy += mixed * mixed;
+        }
+        if (mixed_energy > 0.0) {
+            double output_scale = sqrt(source_energy / mixed_energy);
+            for (i = 0; i < n; i++) x[i] = (float)(x[i] * output_scale);
+        }
+    } else {
+        memset(x, 0, sizeof(float) * (size_t)n);
+    }
+}
+
+static double bigvgan_harmonic(double phase, const double *weights, int harmonics)
+{
+    double sample = 0.0;
+    int k;
+    for (k = 1; k <= harmonics; k++)
+        sample += weights[k - 1] * sin(6.283185307179586 * k * phase);
+    return sample;
+}
+
+/* Direct harmonic synthesis: use the decoded LPC envelope for formants, not its time-domain filter. */
+static void bigvgan_render_frame(sam_synth *s, const float *a, float *x, int n, float gain)
+{
+    double source_energy = 0.0, harmonic_energy = 0.0, phase = s->bigvgan_phase;
+    int harmonics = (int)((double)n * 0.4), i;
+    double weights[64];
+    int k;
+    /* Keep partials below 80% of Nyquist to reduce aliasing as pitch changes. */
+    if (harmonics > 64) harmonics = 64;
+    for (i = 0; i < n; i++) source_energy += (double)x[i] * x[i];
+    if (harmonics < 1 || source_energy <= 0.0) {
+        memset(x, 0, sizeof(float) * (size_t)n);
+        return;
+    }
+    for (k = 1; k <= harmonics; k++) {
+        double omega = 6.283185307179586 * k / n;
+        double re = 0.0, im = 0.0, weight;
+        int j;
+        for (j = 0; j <= s->v->order; j++) {
+            re += (double)a[j] * cos(omega * j);
+            im -= (double)a[j] * sin(omega * j);
+        }
+        weight = 1.0 / (pow((double)k, 0.25) * sqrt(re * re + im * im));
+        if (harmonics >= 8 && k > harmonics - 8) {
+            double fade = (double)(harmonics - k) / 8.0;
+            weight *= 0.5 - 0.5 * cos(3.141592653589793 * fade);
+        }
+        weights[k - 1] = weight;
+    }
+    for (i = 0; i < n; i++) {
+        double sample = bigvgan_harmonic(phase, weights, harmonics);
+        harmonic_energy += sample * sample;
+        phase += 1.0 / n;
+        if (phase >= 1.0) phase -= 1.0;
+    }
+    if (harmonic_energy <= 0.0) {
+        memset(x, 0, sizeof(float) * (size_t)n);
+        return;
+    }
+    {
+        double harmonic_scale = sqrt(source_energy / harmonic_energy) * gain;
+        phase = s->bigvgan_phase;
+        for (i = 0; i < n; i++) {
+            x[i] = (float)(bigvgan_harmonic(phase, weights, harmonics) * harmonic_scale);
+            phase += 1.0 / n;
+            if (phase >= 1.0) phase -= 1.0;
+        }
+    }
+    s->bigvgan_phase = phase;
+}
+
+/* Resynthesize each selected unit's pulse spectrum as harmonics without LPC or formant filtering. */
+static void concat_harmonic_render(sam_synth *s, float *x, int n, double sr, float gain)
+{
+    const double two_pi = 6.283185307179586;
+    double weights[64], phase_target[64], phase_start[64];
+    double source_energy = 0.0, harmonic_energy = 0.0;
+    double phase = s->bigvgan_phase;
+    int harmonics = (int)((double)n * 0.46), i, k;
+    if (n <= 0) return;
+    if (harmonics > 64) harmonics = 64;
+    for (i = 0; i < n; i++) source_energy += (double)x[i] * x[i];
+    if (harmonics < 1 || source_energy <= 0.0 || gain == 0.0f) {
+        memset(x, 0, sizeof(float) * (size_t)n);
+        return;
+    }
+    for (k = 1; k <= harmonics; k++) {
+        double omega = two_pi * k / n;
+        double re = 0.0, im = 0.0, magnitude, frequency = (double)k * sr / n;
+        double taper = 1.0, target_phase, delta;
+        for (i = 0; i < n; i++) {
+            re += (double)x[i] * cos(omega * i);
+            im -= (double)x[i] * sin(omega * i);
+        }
+        magnitude = 2.0 * sqrt(re * re + im * im) / n;
+        if (frequency > sr * 0.36) {
+            double fade = (sr * 0.48 - frequency) / (sr * 0.12);
+            if (fade < 0.0) fade = 0.0;
+            taper = 0.5 - 0.5 * cos(3.141592653589793 * fade);
+        }
+        weights[k - 1] = magnitude * taper / pow((double)k, 0.25);
+        target_phase = atan2(im, re) + 0.5 * 3.141592653589793;
+        if (!s->concat_phase_valid[k - 1]) {
+            phase_start[k - 1] = target_phase;
+            s->concat_phase_valid[k - 1] = 1;
+        } else {
+            phase_start[k - 1] = s->concat_phase_offset[k - 1];
+        }
+        delta = atan2(sin(target_phase - phase_start[k - 1]),
+                      cos(target_phase - phase_start[k - 1]));
+        phase_target[k - 1] = phase_start[k - 1] + delta;
+        s->concat_phase_offset[k - 1] = phase_target[k - 1];
+        harmonic_energy += weights[k - 1] * weights[k - 1] * 0.5;
+    }
+    if (harmonic_energy <= 0.0) {
+        memset(x, 0, sizeof(float) * (size_t)n);
+        return;
+    }
+    {
+        double scale = sqrt(source_energy / harmonic_energy) * gain;
+        for (k = 0; k < harmonics; k++) weights[k] *= scale;
+    }
+    for (i = 0; i < n; i++) {
+        double sample = 0.0;
+        double mix = (double)(i + 1) / n;
+        for (k = 1; k <= harmonics; k++) {
+            double offset = phase_start[k - 1] + mix * (phase_target[k - 1] - phase_start[k - 1]);
+            sample += weights[k - 1] * sin(two_pi * k * phase + offset);
+        }
+        x[i] = (float)sample;
+        phase += 1.0 / n;
+        if (phase >= 1.0) phase -= 1.0;
+    }
+    s->bigvgan_phase = phase;
+    s->concat_f0 = sr / n;
+    s->concat_f0_valid = 1;
+}
+
+/* Generate voiced harmonics from the frame's formant envelope, without decoded vowel excitation. */
+static void spectral_render_frame(sam_synth *s, const float *a, float *x, int n, float gain, int voiced)
+{
+    const double two_pi = 6.283185307179586;
+    double amplitude[64], start_amplitude[64], phase = s->bigvgan_phase;
+    double sr = (double)(float)(s->p.out_rate > 0 ? s->p.out_rate : s->v->rate);
+    double start_f0, target_f0, max_f0, harmonic_energy = 0.0;
+    int harmonics, render_harmonics, i, k;
+    if (n <= 0) return;
+    target_f0 = sr / n;
+    if (!s->spectral_f0_valid) {
+        s->spectral_f0 = target_f0;
+        s->spectral_f0_valid = 1;
+    }
+    start_f0 = s->spectral_f0;
+    if (voiced) {
+        double smoothing = 1.0 - exp(-(double)n / (sr * 0.008));
+        s->spectral_f0 += smoothing * (target_f0 - s->spectral_f0);
+    }
+    target_f0 = s->spectral_f0;
+    max_f0 = start_f0 > target_f0 ? start_f0 : target_f0;
+    harmonics = (int)(sr * 0.48 / max_f0);
+    if (harmonics > 64) harmonics = 64;
+    render_harmonics = harmonics > s->spectral_harmonics ? harmonics : s->spectral_harmonics;
+    if (render_harmonics > 64) render_harmonics = 64;
+    for (k = 1; k <= harmonics; k++) {
+        double omega = two_pi * k * max_f0 / sr;
+        double ar = 0.0, ai = 0.0;
+        int j;
+        for (j = 0; j <= s->v->order; j++) {
+            ar += (double)a[j] * cos(omega * j);
+            ai -= (double)a[j] * sin(omega * j);
+        }
+        {
+            double denominator = ar * ar + ai * ai;
+            double env = denominator > 1e-18 ? 1.0 / sqrt(denominator) : 0.0;
+            amplitude[k - 1] = env / pow((double)k, 0.8);
+        }
+        {
+            double frequency = k * max_f0;
+            const double fade_start = sr * 0.36, fade_end = sr * 0.48;
+            if (frequency > fade_start) {
+                double fade = (fade_end - frequency) / (fade_end - fade_start);
+                if (fade < 0.0) fade = 0.0;
+                amplitude[k - 1] *= 0.5 - 0.5 * cos(3.141592653589793 * fade);
+            }
+        }
+        harmonic_energy += amplitude[k - 1] * amplitude[k - 1] * 0.5;
+    }
+    if (harmonic_energy <= 0.0 || gain == 0.0f) {
+        memset(x, 0, sizeof(float) * (size_t)n);
+        return;
+    }
+    {
+        double scale = 4000.0 * (double)gain / sqrt(harmonic_energy);
+        for (k = 0; k < harmonics; k++) amplitude[k] *= scale;
+    }
+    for (k = 0; k < harmonics; k++) {
+        start_amplitude[k] = s->spectral_amplitude[k];
+        s->spectral_amplitude[k] = amplitude[k];
+    }
+    for (k = harmonics; k < render_harmonics; k++) {
+        start_amplitude[k] = s->spectral_amplitude[k];
+        amplitude[k] = 0.0;
+        s->spectral_amplitude[k] = 0.0;
+    }
+    for (i = 0; i < n; i++) {
+        double sample = 0.0;
+        double frame_mix = (double)(i + 1) / n;
+        double f0 = start_f0 + frame_mix * (target_f0 - start_f0);
+        for (k = 1; k <= render_harmonics; k++) {
+            double amp = start_amplitude[k - 1] +
+                         frame_mix * (amplitude[k - 1] - start_amplitude[k - 1]);
+            sample += amp * sin(two_pi * k * phase);
+        }
+        x[i] = (float)sample;
+        phase += f0 / sr;
+        phase -= floor(phase);
+    }
+    s->bigvgan_phase = phase;
+    s->spectral_harmonics = harmonics;
+}
+
+static unsigned spectral_noise_random(sam_synth *s)
+{
+    s->spectral_noise_state = s->spectral_noise_state * 1664525u + 1013904223u;
+    return s->spectral_noise_state;
+}
+
+static void spectral_transition_fade(float *x, int n, double sr, int fade_in, int fade_out)
+{
+    int fade_samples = (int)(sr * 0.003), i;
+    if (n < 2 || (!fade_in && !fade_out)) return;
+    if (fade_samples < 2) fade_samples = 2;
+    if (fade_in && fade_out && n >= 4 && fade_samples > n / 2) fade_samples = n / 2;
+    if (fade_samples > n) fade_samples = n;
+    for (i = 0; i < fade_samples; i++) {
+        double phase = (double)i / (fade_samples - 1);
+        double up = 0.5 - 0.5 * cos(3.141592653589793 * phase);
+        if (fade_in) x[i] = (float)(x[i] * up);
+        if (fade_out) x[n - fade_samples + i] = (float)(x[n - fade_samples + i] * (1.0 - up));
+    }
+}
+
+static void spectral_smooth_boundary(sam_synth *s, float *x, int n, double sr)
+{
+    int fade_samples = (int)(sr * 0.006), i;
+    if (n <= 0) return;
+    if (n == 1) {
+        s->spectral_last_sample = x[0];
+        s->spectral_sample_valid = 1;
+        return;
+    }
+    if (fade_samples < 2) fade_samples = 2;
+    if (fade_samples > n) fade_samples = n;
+    if (s->spectral_sample_valid) {
+        double correction = (double)s->spectral_last_sample - x[0];
+        for (i = 0; i < fade_samples; i++) {
+            double phase = (double)i / (fade_samples - 1);
+            double weight = 0.5 + 0.5 * cos(3.141592653589793 * phase);
+            x[i] = (float)(x[i] + correction * weight);
+        }
+    }
+    s->spectral_last_sample = x[n - 1];
+    s->spectral_sample_valid = 1;
+}
+
+/* Generated broadband consonants, shaped by the frame envelope but not its decoded samples. */
+static void spectral_render_noise(sam_synth *s, const float *a, float *x, int n, float level)
+{
+    const double two_pi = 6.283185307179586;
+    const int count = 120;
+    double amplitude[128], energy = 0.0;
+    double sr = (double)(float)(s->p.out_rate > 0 ? s->p.out_rate : s->v->rate);
+    int i, k, j;
+    if (n <= 0) return;
+    if (s->spectral_f0_valid) {
+        s->bigvgan_phase += (double)n * s->spectral_f0 / sr;
+        s->bigvgan_phase -= floor(s->bigvgan_phase);
+    }
+    if (!s->spectral_noise_valid) {
+        for (k = 0; k < count; k++) {
+            double jitter = ((spectral_noise_random(s) >> 8) / 16777216.0 - 0.5) * (sr / 256.0) * 0.8;
+            s->spectral_noise_frequency[k] = (k + 1) * sr / 256.0 + jitter;
+            s->spectral_noise_phase[k] = two_pi * ((spectral_noise_random(s) >> 8) / 16777216.0);
+        }
+        s->spectral_noise_valid = 1;
+    }
+    for (k = 0; k < count; k++) {
+        double freq = s->spectral_noise_frequency[k];
+        double omega = two_pi * freq / sr;
+        double re = 0.0, im = 0.0, den, taper = 1.0;
+        for (j = 0; j <= s->v->order; j++) {
+            re += (double)a[j] * cos(omega * j);
+            im -= (double)a[j] * sin(omega * j);
+        }
+        den = re * re + im * im;
+        if (freq > sr * 0.42) {
+            double fade = (sr * 0.5 - freq) / (sr * 0.08);
+            if (fade < 0.0) fade = 0.0;
+            taper = 0.5 - 0.5 * cos(3.141592653589793 * fade);
+        }
+        amplitude[k] = den > 1e-18 ? taper / sqrt(den) : 0.0;
+        energy += amplitude[k] * amplitude[k] * 0.5;
+    }
+    if (energy <= 0.0 || level == 0.0f) {
+        memset(x, 0, sizeof(float) * (size_t)n);
+        return;
+    }
+    {
+        double scale = fabs((double)level) / sqrt(energy);
+        for (k = 0; k < count; k++) {
+            amplitude[k] *= scale;
+            amplitude[k] = s->spectral_noise_amplitude[k] +
+                           (1.0 - exp(-(double)n / (sr * 0.004))) *
+                               (amplitude[k] - s->spectral_noise_amplitude[k]);
+            s->spectral_noise_amplitude[k] = amplitude[k];
+        }
+    }
+    for (i = 0; i < n; i++) {
+        double sample = 0.0;
+        for (k = 0; k < count; k++) {
+            sample += amplitude[k] * sin(s->spectral_noise_phase[k]);
+            s->spectral_noise_phase[k] += two_pi * s->spectral_noise_frequency[k] / sr;
+            if (s->spectral_noise_phase[k] >= two_pi) s->spectral_noise_phase[k] -= two_pi;
+        }
+        x[i] = (float)sample;
+    }
+}
+
+static void pulse_peak_control(float *x, size_t n)
+{
+    const double peak_limit = 30000.0;
+    double peak = 0.0;
+    size_t i;
+    for (i = 0; i < n; i++) {
+        double mag = fabs((double)x[i]);
+        if (mag > peak) peak = mag;
+    }
+    if (peak > peak_limit) {
+        double scale = peak_limit / peak;
+        for (i = 0; i < n; i++) {
+            x[i] = (float)(x[i] * scale);
+        }
+    }
+}
+
+static void smooth_peak_control(double *state, float *x, int n, double sr, double release_seconds)
+{
+    const double peak_limit = 30000.0;
+    double peak = 0.0, target = 1.0, attack, release, coeff, gain;
+    int i;
+    for (i = 0; i < n; i++) {
+        double mag = fabs((double)x[i]);
+        if (mag > peak) peak = mag;
+    }
+    if (peak > peak_limit) target = peak_limit / peak;
+    attack = exp(-(double)n / (sr * 0.005));
+    release = exp(-(double)n / (sr * release_seconds));
+    coeff = target < *state ? attack : release;
+    gain = target + coeff * (*state - target);
+    *state = gain;
+    for (i = 0; i < n; i++) x[i] = (float)(x[i] * gain);
 }
 
 /* FUN_5ed42a8f: clip to [-32768, 32767], then float -> int16 by truncation */
@@ -706,9 +1120,23 @@ int sam_synth_segment(sam_synth *s, const sam_segment *g_in, sam_pcm_cb cb, void
     if (g.unit == 0) { /* silence: zero samples, reset the filter */
         int n = (int)(sr * (double)g.dur);
         memset(s->mem, 0, sizeof(float) * (v->order + 1));
+        s->spectral_last_voiced = 0;
+        s->spectral_voicing_valid = 1;
+        if (s->p.vocoder == SAM_VOCODER_SPECTRAL && s->spectral_f0_valid) {
+            s->bigvgan_phase += (double)n * s->spectral_f0 / sr;
+            s->bigvgan_phase -= floor(s->bigvgan_phase);
+        } else if (s->p.vocoder == SAM_VOCODER_BIGVGAN_CONCAT && s->concat_f0_valid) {
+            s->bigvgan_phase += (double)n * s->concat_f0 / sr;
+            s->bigvgan_phase -= floor(s->bigvgan_phase);
+        }
         out = scratch(s, (size_t)n + 1);
         if (!out) return -1;
         for (i = 0; i < n; i++) out[i] = 0.0f;
+        if (s->p.vocoder == SAM_VOCODER_SPECTRAL ||
+            s->p.vocoder == SAM_VOCODER_BIGVGAN_CONCAT)
+            spectral_smooth_boundary(s, out, n, sr);
+        else
+            s->spectral_sample_valid = 0;
         s->chunk_pos = (s->chunk_pos + n) % (CHUNK_FLUSH + 1);
         emit(out, n, cb, user);
         return 0;
@@ -785,6 +1213,8 @@ int sam_synth_segment(sam_synth *s, const sam_segment *g_in, sam_pcm_cb cb, void
         } else {
             fit_period(src, src_n, dst, n, v->window, v->fft_n);
         }
+        if (s->p.vocoder == SAM_VOCODER_PULSE && u.periods[f] > 0.0f)
+            pulse_excitation(dst, n);
         if (amp != 1.0f)
             for (i = 0; i < n; i++) dst[i] = (float)((double)amp * dst[i]);
         a = u.lpc + f * (u.order + 1);
@@ -822,7 +1252,44 @@ int sam_synth_segment(sam_synth *s, const sam_segment *g_in, sam_pcm_cb cb, void
                 }
             }
         }
-        lpc_filter(s, a, dst, n, s->p.gain);
+        if (s->p.vocoder == SAM_VOCODER_BIGVGAN) {
+            if (u.periods[f] > 0.0f)
+                bigvgan_render_frame(s, a, dst, n, s->p.gain);
+            else if (s->p.gain != 1.0f)
+                for (i = 0; i < n; i++) dst[i] = (float)((double)dst[i] * s->p.gain);
+            smooth_peak_control(&s->bigvgan_gain, dst, n,
+                                (double)(float)(s->p.out_rate > 0 ? s->p.out_rate : v->rate), 0.08);
+        } else if (s->p.vocoder == SAM_VOCODER_BIGVGAN_CONCAT) {
+            if (u.periods[f] > 0.0f) {
+                concat_harmonic_render(s, dst, n, sr, s->p.gain);
+            } else {
+                if (s->p.gain != 1.0f)
+                    for (i = 0; i < n; i++) dst[i] = (float)((double)dst[i] * s->p.gain);
+                if (s->concat_f0_valid) {
+                    s->bigvgan_phase += (double)n * s->concat_f0 / sr;
+                    s->bigvgan_phase -= floor(s->bigvgan_phase);
+                }
+            }
+        } else if (s->p.vocoder == SAM_VOCODER_SPECTRAL) {
+            int voiced = u.periods[f] > 0.0f;
+            int previous_voiced = e > 0 ? u.periods[frame[e - 1]] > 0.0f :
+                                          s->spectral_last_voiced;
+            int fade_in = (s->spectral_voicing_valid || e > 0) && (previous_voiced != voiced);
+            int fade_out = e + 1 < n_e && ((u.periods[frame[e + 1]] > 0.0f) != voiced);
+            if (voiced)
+                spectral_render_frame(s, a, dst, n, s->p.gain, 1);
+            else
+                spectral_render_noise(s, a, dst, n, s->p.gain * u.gains[f] * 0.08f);
+            spectral_transition_fade(dst, n,
+                                     (double)(float)(s->p.out_rate > 0 ? s->p.out_rate : v->rate),
+                                     fade_in, fade_out);
+            s->spectral_last_voiced = voiced;
+            s->spectral_voicing_valid = 1;
+            smooth_peak_control(&s->spectral_gain, dst, n,
+                                (double)(float)(s->p.out_rate > 0 ? s->p.out_rate : v->rate), 0.02);
+        } else {
+            lpc_filter(s, a, dst, n, s->p.gain);
+        }
         n_out += (size_t)n;
         tsamp += n;
         s->chunk_pos += n;
@@ -834,6 +1301,23 @@ int sam_synth_segment(sam_synth *s, const sam_segment *g_in, sam_pcm_cb cb, void
             out[i] = out[n_out - 1 - i];
             out[n_out - 1 - i] = tmp;
         }
+    if (s->p.vocoder == SAM_VOCODER_BIGVGAN_CONCAT && n_out > 0) {
+        double energy = 0.0, rms, target = 4500.0 * fabs((double)s->p.gain);
+        double scale;
+        for (i = 0; i < (int)n_out; i++) energy += (double)out[i] * out[i];
+        rms = sqrt(energy / (double)n_out);
+        if (rms > 0.0 && target > 0.0) {
+            scale = target / rms;
+            for (i = 0; i < (int)n_out; i++) out[i] = (float)(out[i] * scale);
+        }
+        smooth_peak_control(&s->concat_peak_gain, out, (int)n_out, sr, 0.04);
+    }
+    if (s->p.vocoder == SAM_VOCODER_SPECTRAL ||
+        s->p.vocoder == SAM_VOCODER_BIGVGAN_CONCAT)
+        spectral_smooth_boundary(s, out, (int)n_out, sr);
+    else
+        s->spectral_sample_valid = 0;
+    if (s->p.vocoder == SAM_VOCODER_PULSE) pulse_peak_control(out, n_out);
     emit(out, (int)n_out, cb, user);
     free(offs);
     free(frame);

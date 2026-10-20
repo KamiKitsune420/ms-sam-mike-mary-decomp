@@ -70,11 +70,17 @@ typedef struct {
     volatile long long at_cancel;
     int16_t *pcm;
     long long ncap;
+    int max_sample;
 } ctx;
 
 static int audio(const int16_t *pcm, size_t n, void *user)
 {
     ctx *c = user;
+    size_t i;
+    for (i = 0; i < n; i++) {
+        int magnitude = pcm[i] < 0 ? -(int)pcm[i] : pcm[i];
+        if (magnitude > c->max_sample) c->max_sample = magnitude;
+    }
     if (c->pcm && c->samples + (long long)n <= c->ncap) memcpy(c->pcm + c->samples, pcm, n * sizeof *pcm);
     c->samples += (long long)n;
     if (c->stop_after && c->samples >= c->stop_after) {
@@ -147,6 +153,7 @@ int main(int argc, char **argv)
     {
         sam_speech *t2 = sam_tts_open(dir, "Sam", err, sizeof err);
         ctx d;
+        int vocoder_rc;
         memset(&d, 0, sizeof d);
         d.t = t2;
         d.text = LONG_TEXT;
@@ -158,6 +165,24 @@ int main(int argc, char **argv)
         check(rc == 0 && d.samples == full && !memcmp(c.pcm, d.pcm, (size_t)full * sizeof *d.pcm),
               "a freshly opened handle renders the same text identically");
         check(d.nword == c.nword && d.nsent == c.nsent, "and reports the same events");
+        vocoder_rc = t2 ? sam_tts_set_vocoder(t2, "bigvgan-inspired") : -1;
+        check(vocoder_rc == 0, "the BigVGAN-inspired vocoder can be selected");
+        if (vocoder_rc == 0) {
+            size_t i;
+            int different = 0;
+            memset(d.pcm, 0, (size_t)d.ncap * sizeof *d.pcm);
+            d.samples = 0;
+            d.nword = d.nsent = d.nbm = d.nev = 0;
+            d.last_ev = 0;
+            d.max_sample = 0;
+            d.order_ok = d.span_ok = d.pos_ok = 1;
+            rc = sam_tts_speak(t2, LONG_TEXT, 0, &cb);
+            for (i = 0; i < (size_t)(d.samples < full ? d.samples : full); i++)
+                if (d.pcm[i] != c.pcm[i]) { different = 1; break; }
+            check(rc == 0 && d.samples == full && different,
+                  "the alternative vocoder changes voiced audio without changing duration");
+            check(d.max_sample <= 30000, "the alternative vocoder keeps peaks below the clipping ceiling");
+        }
         free(d.pcm);
         sam_tts_close(t2);
     }

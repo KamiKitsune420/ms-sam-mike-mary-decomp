@@ -121,6 +121,18 @@ int sam_tts_set_effect(sam_speech *t, const char *name)
     return load_engine(t, err, sizeof err); /* monotone / whisper live in the synthesizer */
 }
 
+int sam_tts_set_vocoder(sam_speech *t, const char *name)
+{
+    char err[256];
+    int mode;
+    if (!name || !strcmp(name, "sam")) mode = SAM_VOCODER_SAM;
+    else if (!strcmp(name, "bigvgan-inspired")) mode = SAM_VOCODER_BIGVGAN_INSPIRED;
+    else return -1;
+    if (t->p.vocoder == mode) return 0;
+    t->p.vocoder = mode;
+    return load_engine(t, err, sizeof err);
+}
+
 /* ------------------------------------------------------------------ SAPI XML */
 
 /* A speak call is a list of ops: runs of plain text (each with the state that was in force) and

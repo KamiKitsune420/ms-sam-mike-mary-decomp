@@ -1,0 +1,7 @@
+# Pinned runtime dependencies for tools/bigvgan_say.py (Python 3.12).
+# Install the matching PyTorch wheel separately for your CPU/CUDA setup.
+torch==2.2.2
+numpy==1.26.4
+librosa==0.10.2.post1
+scipy==1.12.0
+huggingface_hub==0.23.4

@@ -82,6 +82,10 @@ SAM_API void sam_tts_set_pitch(sam_speech *t, int pitch);
  * unknown name (the effect is then left alone). */
 SAM_API int sam_tts_set_effect(sam_speech *t, const char *name);
 
+/* Select "sam" (default) or "bigvgan-inspired" (algorithmic, without learned model weights).
+ * Returns 0, or -1 for an unknown name or engine reload failure. */
+SAM_API int sam_tts_set_vocoder(sam_speech *t, const char *name);
+
 /* Speak UTF-8 text; returns 0 when done, 1 when cancelled/stopped, -1 on error.
  * Not reentrant for one sam_speech; use one handle per thread. */
 SAM_API int sam_tts_speak(sam_speech *t, const char *utf8, int flags, const sam_callbacks *cb);

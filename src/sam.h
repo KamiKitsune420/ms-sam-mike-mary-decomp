@@ -19,8 +19,16 @@ extern "C" {
 
 #define SAM_MAX_KNOTS 20
 
+enum {
+    SAM_VOCODER_SAM = 0,
+    SAM_VOCODER_BIGVGAN_INSPIRED = 1
+};
+
 typedef struct sam_voice sam_voice;
 typedef struct sam_synth sam_synth;
+/* LPC coefficients and the RMS level of the excitation for one output frame. */
+typedef int (*sam_lpc_frame_cb)(void *user, const float *lpc, int order, int samples, int voiced, float amp,
+                                int sample_rate);
 
 /* One back-end segment, as produced by the engine's front end (the "segment record"). */
 typedef struct {
@@ -50,6 +58,9 @@ typedef struct {
     float base_pitch;    /* the voice's base pitch in Hz, from its .sdf (Sam 100, Mike 110, Mary 189) */
     int whisper;         /* SAPI 4 Whisper: every frame gets noise excitation */
     int monotone;        /* SAPI 4 RoboSoft: every pitch point = the base pitch */
+    int vocoder;         /* SAM_VOCODER_*; default preserves the original LPC renderer */
+    sam_lpc_frame_cb lpc_frame_cb; /* optional per-frame LPC feature export */
+    void *lpc_frame_user;
 } sam_params;
 
 void sam_params_default(sam_params *p);
@@ -69,6 +80,8 @@ sam_synth *sam_synth_new(const sam_voice *v, const sam_params *p);
 void sam_synth_free(sam_synth *s);
 /* Render one segment. Returns 0 on success. */
 int sam_synth_segment(sam_synth *s, const sam_segment *seg, sam_pcm_cb cb, void *user);
+/* Render one unit at its stored pitch periods and native duration, without pitch/time warping. */
+int sam_synth_unit_raw(sam_synth *s, int unit, sam_pcm_cb cb, void *user);
 
 /* ---- text to speech ---- */
 

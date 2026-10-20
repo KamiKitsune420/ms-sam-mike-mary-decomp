@@ -48,6 +48,8 @@ struct sam_synth {
     int w_on;
     double w_o0, w_o1, w_s0, w_s1, w_nat, w_hold;
     unsigned vib_state;  /* synth +0x80 */
+    double vocoder_phase;
+    float unvoiced_lp;
     float *buf;          /* scratch output */
     size_t buf_cap;
 };
@@ -507,6 +509,9 @@ void sam_params_default(sam_params *p)
     p->whisper = 0;
     p->monotone = 0;
     p->no_reverse = 0;
+    p->vocoder = SAM_VOCODER_SAM;
+    p->lpc_frame_cb = NULL;
+    p->lpc_frame_user = NULL;
 }
 
 sam_synth *sam_synth_new(const sam_voice *v, const sam_params *p)
@@ -584,6 +589,89 @@ static void lpc_filter(sam_synth *s, const float *a, float *x, int n, float gain
     }
 }
 
+static void bigvgan_inspired_source(sam_synth *s, const float *src, int src_n, float *dst, int n, int period)
+{
+    const double voiced_level = 0.25;
+    double weights[129], weight_sq = 0.0, source_sq = 0.0, output_sq = 0.0;
+    double phase = s->vocoder_phase, step, source_rms, output_rms, normalization;
+    int max_h, h, i;
+    if (period < 1 || src_n < 1) {
+        memset(dst, 0, sizeof(float) * (size_t)n);
+        return;
+    }
+    for (i = 0; i < src_n; i++) source_sq += (double)src[i] * src[i];
+    source_rms = sqrt(source_sq / src_n);
+    if (source_rms == 0.0) {
+        memset(dst, 0, sizeof(float) * (size_t)n);
+        return;
+    }
+    max_h = (int)(period * 0.48);
+    if (max_h > 128) max_h = 128;
+    if (max_h < 1) max_h = 1;
+    for (h = 1; h <= max_h; h++) {
+        double frequency = (double)h / period;
+        double taper = 1.0;
+        if (frequency > 0.40) {
+            double x = (frequency - 0.40) / 0.08;
+            if (x > 1.0) x = 1.0;
+            taper = 0.5 + 0.5 * cos(3.14159265358979323846 * x);
+        }
+        double bass_trim = sqrt((double)h / (h + 3.0));
+        weights[h] = pow((double)h, -1.1) * taper * bass_trim;
+        weight_sq += weights[h] * weights[h];
+    }
+    normalization = sqrt(2.0 / weight_sq);
+    step = 2.0 * 3.14159265358979323846 / period;
+    for (i = 0; i < n; i++) {
+        double harmonic = 0.0;
+        for (h = 1; h <= max_h; h++) harmonic += weights[h] * sin(phase * h);
+        harmonic *= normalization;
+        dst[i] = (float)harmonic;
+        phase += step;
+        if (phase >= 2.0 * 3.14159265358979323846) phase = fmod(phase, 2.0 * 3.14159265358979323846);
+        output_sq += (double)dst[i] * dst[i];
+    }
+    output_rms = n > 0 ? sqrt(output_sq / n) : 0.0;
+    if (output_rms > 0.0) {
+        double scale = source_rms * voiced_level / output_rms;
+        for (i = 0; i < n; i++) dst[i] = (float)(dst[i] * scale);
+    }
+    s->vocoder_phase = phase;
+}
+
+static void soft_clip_bigvgan_output(float *x, int n)
+{
+    const double knee = 24000.0;
+    const double ceiling = 30000.0;
+    int i;
+    for (i = 0; i < n; i++) {
+        double sample = x[i], magnitude = fabs(sample);
+        if (magnitude > knee) {
+            double compressed = knee + (ceiling - knee) * tanh((magnitude - knee) / (ceiling - knee));
+            x[i] = (float)(sample < 0.0 ? -compressed : compressed);
+        }
+    }
+}
+
+static void filter_bigvgan_unvoiced(sam_synth *s, float *x, int n, double sr)
+{
+    const double cutoff = 5500.0;
+    double alpha = exp(-2.0 * 3.14159265358979323846 * cutoff / sr);
+    int i;
+    for (i = 0; i < n; i++) {
+        s->unvoiced_lp = (float)((1.0 - alpha) * x[i] + alpha * s->unvoiced_lp);
+        x[i] = s->unvoiced_lp;
+    }
+}
+
+static void attenuate_bigvgan_unvoiced(sam_synth *s, float *x, int n)
+{
+    const float gain = 0.5f;
+    int i;
+    for (i = 0; i < n; i++) x[i] *= gain;
+    for (i = 0; i <= s->v->order; i++) s->mem[i] *= gain;
+}
+
 /* FUN_5ed42a8f: clip to [-32768, 32767], then float -> int16 by truncation */
 static int16_t to_pcm(float x)
 {
@@ -601,6 +689,61 @@ static void emit(const float *x, int n, sam_pcm_cb cb, void *user)
         while (k < 1024 && i < n) tmp[k++] = to_pcm(x[i++]);
         cb(tmp, (size_t)k, user);
     }
+}
+
+static float excitation_rms(const float *x, int n)
+{
+    double sum = 0.0;
+    int i;
+    if (n <= 0) return 0.0f;
+    for (i = 0; i < n; i++) sum += (double)x[i] * x[i];
+    return (float)sqrt(sum / n);
+}
+
+int sam_synth_unit_raw(sam_synth *s, int index, sam_pcm_cb cb, void *user)
+{
+    const sam_voice *v;
+    sam_unit u;
+    float *out;
+    int frame, pos = 0, rc = -1;
+    if (!s || !cb) return -1;
+    v = s->v;
+    if (unit_decode(v, index, &s->noise_pos, &u, s->p.whisper) != 0) return -1;
+    out = scratch(s, (size_t)u.total + 1);
+    if (!out) goto done;
+    for (frame = 0; frame < u.nframes; frame++) {
+        int n = (int)fabsf(u.periods[frame]);
+        float *dst = out + pos;
+        if (s->p.vocoder == SAM_VOCODER_BIGVGAN_INSPIRED && u.periods[frame] > 0.0f)
+            bigvgan_inspired_source(s, u.exc + pos, n, dst, n, n);
+        else
+            memcpy(dst, u.exc + pos, sizeof(float) * (size_t)n);
+        if (s->p.lpc_frame_cb &&
+            s->p.lpc_frame_cb(s->p.lpc_frame_user, u.lpc + frame * (u.order + 1), u.order, n,
+                              u.periods[frame] > 0.0f, excitation_rms(dst, n), v->rate) != 0)
+            goto done;
+        lpc_filter(s, u.lpc + frame * (u.order + 1), dst, n, s->p.gain);
+        if (s->p.vocoder == SAM_VOCODER_BIGVGAN_INSPIRED) {
+            if (u.periods[frame] <= 0.0f) {
+                filter_bigvgan_unvoiced(s, dst, n, v->rate);
+                attenuate_bigvgan_unvoiced(s, dst, n);
+            }
+            else s->unvoiced_lp = 0.0f;
+            soft_clip_bigvgan_output(dst, n);
+        }
+        pos += n;
+    }
+    if (s->p.reverse_units)
+        for (frame = 0; frame < pos / 2; frame++) {
+            float tmp = out[frame];
+            out[frame] = out[pos - 1 - frame];
+            out[pos - 1 - frame] = tmp;
+        }
+    emit(out, pos, cb, user);
+    rc = 0;
+done:
+    sam_unit_free(&u);
+    return rc;
 }
 
 /* PitchMarks_Place (FUN_5ed42bda): choose a source frame and an output period for every epoch. */
@@ -706,6 +849,10 @@ int sam_synth_segment(sam_synth *s, const sam_segment *g_in, sam_pcm_cb cb, void
     if (g.unit == 0) { /* silence: zero samples, reset the filter */
         int n = (int)(sr * (double)g.dur);
         memset(s->mem, 0, sizeof(float) * (v->order + 1));
+        s->vocoder_phase = 0.0;
+        s->unvoiced_lp = 0.0f;
+        if (s->p.lpc_frame_cb && s->p.lpc_frame_cb(s->p.lpc_frame_user, NULL, v->order, n, 0, 0.0f, (int)sr))
+            return -1;
         out = scratch(s, (size_t)n + 1);
         if (!out) return -1;
         for (i = 0; i < n; i++) out[i] = 0.0f;
@@ -778,7 +925,9 @@ int sam_synth_segment(sam_synth *s, const sam_segment *g_in, sam_pcm_cb cb, void
         if (s->chunk_pos + n > CHUNK_GUARD) n = GUARD_PERIOD;
         amp = (float)knot_interp(&g, g.amp, (double)tsamp);
         /* Excitation_FetchPeriod (FUN_5ed42e40) */
-        if (rev[e]) {
+        if (s->p.vocoder == SAM_VOCODER_BIGVGAN_INSPIRED && u.periods[f] > 0.0f) {
+            bigvgan_inspired_source(s, src, src_n, dst, n, len[e]);
+        } else if (rev[e]) {
             for (i = 0; i < n; i++) dst[i] = src[n - 1 - i < src_n ? n - 1 - i : src_n - 1];
         } else if (src_n == n) {
             memcpy(dst, src, sizeof(float) * n);
@@ -807,7 +956,8 @@ int sam_synth_segment(sam_synth *s, const sam_segment *g_in, sam_pcm_cb cb, void
                 ai[0] = 1.0f;
                 a = ai;
                 /* crossfade the pulse shapes when both frames are voiced */
-                if (u.periods[f0] > 0 && u.periods[f0 + 1] > 0 && !rev[e]) {
+                if (s->p.vocoder != SAM_VOCODER_BIGVGAN_INSPIRED &&
+                    u.periods[f0] > 0 && u.periods[f0 + 1] > 0 && !rev[e]) {
                     int na = offs[f0 + 1] - offs[f0], nb = offs[f0 + 2] - offs[f0 + 1];
                     tmp = malloc(sizeof(float) * 2 * (size_t)(n > 0 ? n : 1));
                     if (tmp) {
@@ -822,7 +972,19 @@ int sam_synth_segment(sam_synth *s, const sam_segment *g_in, sam_pcm_cb cb, void
                 }
             }
         }
+        if (s->p.lpc_frame_cb &&
+            s->p.lpc_frame_cb(s->p.lpc_frame_user, a, u.order, n, u.periods[f] > 0.0f,
+                              excitation_rms(dst, n), (int)sr))
+            goto callback_error;
         lpc_filter(s, a, dst, n, s->p.gain);
+        if (s->p.vocoder == SAM_VOCODER_BIGVGAN_INSPIRED) {
+            if (u.periods[f] <= 0.0f) {
+                filter_bigvgan_unvoiced(s, dst, n, sr);
+                attenuate_bigvgan_unvoiced(s, dst, n);
+            }
+            else s->unvoiced_lp = 0.0f;
+            soft_clip_bigvgan_output(dst, n);
+        }
         n_out += (size_t)n;
         tsamp += n;
         s->chunk_pos += n;
@@ -841,6 +1003,13 @@ int sam_synth_segment(sam_synth *s, const sam_segment *g_in, sam_pcm_cb cb, void
     free(rev);
     sam_unit_free(&u);
     return 0;
+callback_error:
+    free(offs);
+    free(frame);
+    free(len);
+    free(rev);
+    sam_unit_free(&u);
+    return -1;
 oom:
     free(offs);
     free(frame);

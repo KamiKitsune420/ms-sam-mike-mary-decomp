@@ -105,6 +105,45 @@ Experiment knobs (not in the original engine):
 --rate 48000         run the vocoder at another sample rate (real 48 kHz synthesis, not resampling)
 ```
 
+### BigVGAN-inspired vocoder
+
+`--vocoder bigvgan-inspired` selects an optional native-C harmonic source/filter renderer.
+It builds a band-limited, phase-continuous harmonic excitation for voiced frames. The recorded
+residual sets excitation level only; its waveform is not mixed into the output. The decoded LPC
+envelope and unvoiced noise are retained. This mode needs no model files or runtime dependencies
+and is intended as an experimental BigVGAN-inspired alternative; it is **not** the neural BigVGAN
+model and cannot reproduce its
+learned sound without trained weights. Voiced excitation uses a softer harmonic slope and lower
+level to reduce harshness and leave headroom for vowel formants; a low-harmonic trim reduces bass,
+unvoiced consonant frames get a gentle 5.5 kHz low-pass to tame hiss, and a smooth soft-knee
+clipper rounds loud peaks without frame-to-frame limiter gain changes;
+the default `--vocoder sam` keeps the original renderer unchanged.
+The same option is available in the `sam` CLI, and library hosts can select it with
+`sam_tts_set_vocoder(t, "bigvgan-inspired")`.
+
+### Neural BigVGAN (offline)
+
+`tools/bigvgan_say.py` runs an actual NVIDIA BigVGAN checkpoint. It feeds the SAM reference waveform
+through NVIDIA's own waveform-to-mel frontend, with the volume normalization used during BigVGAN
+training, then runs one whole-utterance PyTorch inference. This keeps the input features consistent
+with standard checkpoints rather than approximating mels from LPC coefficients, which could cause
+unstable output. The wrapper also checks that the exported timing and reference audio agree and
+preserves exact silence spans. This requires Python, NumPy, librosa, PyTorch, a local checkout of
+NVIDIA's BigVGAN repository with its dependencies installed, and a compatible checkpoint directory
+containing `config.json` and `bigvgan_generator.pt`. No model weights or voice data are included.
+
+```
+python tools\bigvgan_say.py `
+  --sam-say build\x64\sam_say.exe `
+  --data data\voice `
+  --bigvgan-repo C:\models\BigVGAN `
+  --checkpoint C:\models\bigvgan-v2 `
+  "Hello, my name is Microsoft Sam." out.wav
+```
+
+Use `--checkpoint` with either that model directory or its `bigvgan_generator.pt` file. The
+`--device` option accepts `auto` (default), `cpu`, or `cuda`.
+
 ### Singing
 
 `--sing` treats the text as a score, one word per line: the word with syllables split by `-`, then a

@@ -2,6 +2,8 @@
  *
  * usage: sam_say [options] "text" out.wav      ("@file.txt" speaks a UTF-8 text file)
  *   --data DIR      folder containing Sam.spd, LTTS1033.LXA and r1033tts.LXA
+ *   --vocoder sam|bigvgan-inspired   select the default or experimental native renderer
+ *   --dump-lpc FILE export LPC frames with timing for offline neural vocoding
  *   --pitch x --speed x --gain x --vibrato depth rate --no-reverse   (see sam.h)
  *   --reverse-units   play every sound unit backwards      --rate HZ   run the vocoder at another rate
  *   --sing            the text is a score: "twin-kle C4 1 C4 1" per line, "- 1" rest, "tempo 100"
@@ -22,12 +24,44 @@ typedef struct {
     FILE *f;
     unsigned samples;
     sam4fx *fx; /* SAPI 4 voice effect, or NULL */
+    FILE *lpc_file;
+    int lpc_header_written, lpc_rate, lpc_order;
 } sink;
 
 static void put(FILE *f, unsigned v, int n)
 {
     int i;
     for (i = 0; i < n; i++) fputc((int)((v >> (8 * i)) & 0xFF), f);
+}
+
+static void put_float(FILE *f, float x)
+{
+    unsigned bits;
+    memcpy(&bits, &x, sizeof bits);
+    put(f, bits, 4);
+}
+
+static int on_lpc_frame(void *user, const float *lpc, int order, int samples, int voiced, float amp, int rate)
+{
+    sink *s = user;
+    int i;
+    if (!s->lpc_file || order < 0 || samples < 0) return -1;
+    if (!s->lpc_header_written) {
+        if (fwrite("SLPC", 1, 4, s->lpc_file) != 4) return -1;
+        put(s->lpc_file, 1, 4);
+        put(s->lpc_file, (unsigned)rate, 4);
+        put(s->lpc_file, (unsigned)order, 4);
+        s->lpc_header_written = 1;
+        s->lpc_rate = rate;
+        s->lpc_order = order;
+    } else if (s->lpc_rate != rate || s->lpc_order != order) {
+        return -1;
+    }
+    put(s->lpc_file, (unsigned)samples, 4);
+    put(s->lpc_file, (unsigned)(lpc && voiced ? 1 : lpc ? 2 : 0), 4);
+    put_float(s->lpc_file, amp);
+    for (i = 0; i <= order; i++) put_float(s->lpc_file, lpc ? lpc[i] : 0.0f);
+    return ferror(s->lpc_file) ? -1 : 0;
 }
 
 static unsigned g_rate = 22050;
@@ -68,17 +102,26 @@ static void on_pcm(const int16_t *pcm, size_t n, void *user)
 
 int main(int argc, char **argv)
 {
-    const char *dir = NULL, *text = NULL, *out = NULL, *voice = "Sam", *effect = NULL;
+    const char *dir = NULL, *text = NULL, *out = NULL, *voice = "Sam", *effect = NULL, *lpc_path = NULL;
     char spd[1024], lex[1024], lts[1024], err[256];
     sam_params p;
     sam_tts *t;
     sink s;
-    int i, sing = 0, no_smooth = 0, fx_preset = 0, fx_on = 0, no_trim = 0;
+    int i, sing = 0, no_smooth = 0, fx_preset = 0, fx_on = 0, no_trim = 0, synth_rc;
     sam_params_default(&p);
     for (i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--data") && i + 1 < argc) dir = argv[++i];
         else if (!strcmp(argv[i], "--voice") && i + 1 < argc) voice = argv[++i];
         else if (!strcmp(argv[i], "--effect") && i + 1 < argc) effect = argv[++i];
+        else if (!strcmp(argv[i], "--dump-lpc") && i + 1 < argc) lpc_path = argv[++i];
+        else if (!strcmp(argv[i], "--vocoder") && i + 1 < argc) {
+            const char *name = argv[++i];
+            if (!strcmp(name, "bigvgan-inspired")) p.vocoder = SAM_VOCODER_BIGVGAN_INSPIRED;
+            else if (strcmp(name, "sam")) {
+                fprintf(stderr, "sam_say: unknown vocoder %s (sam or bigvgan-inspired)\n", name);
+                return 1;
+            }
+        }
         else if (!strcmp(argv[i], "--no-trim")) no_trim = 1; /* original RoboSoft loudness (clips) */
         else if (!strcmp(argv[i], "--pitch") && i + 1 < argc) p.pitch_scale = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--speed") && i + 1 < argc) p.speed = (float)atof(argv[++i]);
@@ -127,8 +170,19 @@ int main(int argc, char **argv)
         if ((unsigned char)text[0] == 0xef && (unsigned char)text[1] == 0xbb && (unsigned char)text[2] == 0xbf) text += 3;
     }
     if (!text || !out) {
-        fprintf(stderr, "usage: sam_say [--data DIR] [--pitch x] [--speed x] [--gain x] [--vibrato d r] \"text\" out.wav\n");
+        fprintf(stderr, "usage: sam_say [--data DIR] [--vocoder sam|bigvgan-inspired] [--dump-lpc FILE]"
+                        " [--pitch x] [--speed x] [--gain x] [--vibrato d r] \"text\" out.wav\n");
         return 1;
+    }
+    memset(&s, 0, sizeof s);
+    if (lpc_path) {
+        s.lpc_file = fopen(lpc_path, "wb");
+        if (!s.lpc_file) {
+            fprintf(stderr, "sam_say: cannot write %s\n", lpc_path);
+            return 1;
+        }
+        p.lpc_frame_cb = on_lpc_frame;
+        p.lpc_frame_user = &s;
     }
 #ifdef SAM_EMBEDDED
     if (!dir) /* voice data compiled into the program */
@@ -157,6 +211,7 @@ int main(int argc, char **argv)
     }
     if (!t) {
         fprintf(stderr, "sam_say: %s\n", err);
+        if (s.lpc_file) fclose(s.lpc_file);
         return 1;
     }
     s.fx = NULL;
@@ -172,10 +227,14 @@ int main(int argc, char **argv)
     s.samples = 0;
     if (!s.f) {
         fprintf(stderr, "cannot write %s\n", out);
+        if (s.lpc_file) fclose(s.lpc_file);
+        sam_tts_free(t);
         return 1;
     }
     header(s.f, 0);
-    if ((sing ? sam_tts_sing(t, text, on_pcm, &s) : sam_tts_speak_pcm(t, text, on_pcm, &s)) != 0) fprintf(stderr, "sam_say: synthesis error\n");
+    synth_rc = sing ? sam_tts_sing(t, text, on_pcm, &s) : sam_tts_speak_pcm(t, text, on_pcm, &s);
+    if (synth_rc != 0)
+        fprintf(stderr, "sam_say: synthesis error%s\n", s.lpc_file && ferror(s.lpc_file) ? " while writing LPC frames" : "");
     if (s.fx) { /* let the echoes die away: run the effect over silence, like the engine does between sentences */
         static int16_t z[22050];
         int k;
@@ -188,7 +247,17 @@ int main(int argc, char **argv)
     fseek(s.f, 0, SEEK_SET);
     header(s.f, s.samples * 2);
     fclose(s.f);
+    if (s.lpc_file) {
+        if (!s.lpc_header_written) {
+            fprintf(stderr, "sam_say: no LPC frames were produced\n");
+            synth_rc = -1;
+        }
+        if (fclose(s.lpc_file) != 0) {
+            fprintf(stderr, "sam_say: error closing %s\n", lpc_path);
+            synth_rc = -1;
+        }
+    }
     sam_tts_free(t);
     printf("%u samples (%.2f s)\n", s.samples, s.samples / (double)g_rate);
-    return 0;
+    return synth_rc == 0 ? 0 : 1;
 }

@@ -5,6 +5,7 @@
  *   --voice NAME   Sam (default), Mike or Mary
  *   --rate N       -10..18   --volume N  0..100   --pitch N  -10..10
  *   --effect NAME  hall stadium space room whisper robosoft1..robosoft6 monotone
+ *   --vocoder NAME sam (default) or bigvgan-inspired
  *   --xml          the text is SAPI XML        --events   print sentence/word/bookmark events
  */
 #include "sam_tts.h"
@@ -83,7 +84,7 @@ static char *read_file(const char *fn)
 int main(int argc, char **argv)
 {
     const char *dir = getenv("SAM_DATA") ? getenv("SAM_DATA") : ".";
-    const char *voice = "Sam", *effect = NULL, *text = NULL, *out = NULL;
+    const char *voice = "Sam", *effect = NULL, *vocoder = NULL, *text = NULL, *out = NULL;
     int i, rate = 0, volume = 100, pitch = 0, flags = 0, rc;
     char err[256];
     sam_speech *t;
@@ -94,6 +95,7 @@ int main(int argc, char **argv)
         if (!strcmp(argv[i], "--data") && i + 1 < argc) dir = argv[++i];
         else if (!strcmp(argv[i], "--voice") && i + 1 < argc) voice = argv[++i];
         else if (!strcmp(argv[i], "--effect") && i + 1 < argc) effect = argv[++i];
+        else if (!strcmp(argv[i], "--vocoder") && i + 1 < argc) vocoder = argv[++i];
         else if (!strcmp(argv[i], "--rate") && i + 1 < argc) rate = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--volume") && i + 1 < argc) volume = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--pitch") && i + 1 < argc) pitch = atoi(argv[++i]);
@@ -104,7 +106,8 @@ int main(int argc, char **argv)
     }
     if (!text || !out) {
         fprintf(stderr, "usage: sam [--data DIR] [--voice NAME] [--rate N] [--volume N] [--pitch N]"
-                        " [--effect NAME] [--xml] [--events] \"text\"|@file.txt out.wav\n");
+                        " [--effect NAME] [--vocoder sam|bigvgan-inspired] [--xml] [--events]"
+                        " \"text\"|@file.txt out.wav\n");
         return 1;
     }
     if (text[0] == '@') {
@@ -123,6 +126,10 @@ int main(int argc, char **argv)
     }
     if (effect && sam_tts_set_effect(t, effect)) {
         fprintf(stderr, "sam: unknown effect %s (hall stadium space room whisper robosoft1..robosoft6 monotone)\n", effect);
+        return 1;
+    }
+    if (vocoder && sam_tts_set_vocoder(t, vocoder)) {
+        fprintf(stderr, "sam: unknown vocoder %s (sam or bigvgan-inspired)\n", vocoder);
         return 1;
     }
     sam_tts_set_rate(t, rate);

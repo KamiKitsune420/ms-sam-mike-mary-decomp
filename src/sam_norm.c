@@ -1636,15 +1636,18 @@ static int h_duration(sam_norm *nm, int **out)
     long mval;
     int neg = 0, r;
     durinfo *d;
+    if (q >= e0) return DECLINE;
     if (*q == '-') {
         neg = 1;
         q++;
     }
-    while (*q == '0') q++;
-    if (*q == ':') q--;
-    for (colon = q; *colon && *colon != ':'; colon++) {
+    while (q < e0 && *q == '0') q++;
+    /* the ':' case backs up over the separator, which is only inside the token when
+     * something precedes it */
+    if (q > s0 && q < e0 && *q == ':') q--;
+    for (colon = q; colon < e0 && *colon != ':'; colon++) {
     }
-    if (!*colon || colon <= q || colon >= nm->e - 1) return DECLINE;
+    if (colon >= e0 || colon <= q || colon >= e0 - 1) return DECLINE;
     nm->p = q;
     nm->e = colon;
     r = h_num(nm, (int **)&first, "NUMBER");

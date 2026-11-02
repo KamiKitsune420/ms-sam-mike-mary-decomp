@@ -36,7 +36,7 @@ build/sam_standalone: $(LIB) src/sam4fx.c src/sam_say.c src/sam_data.c | build
 test: build/lib_test
 
 build/lib_test: $(TTSLIB) tests/lib/lib_test.c | build
-	$(CC) $(CFLAGS) $^ -lm -lpthread -o $@
+	$(CC) $(CFLAGS) -D_DEFAULT_SOURCE $^ -lm -lpthread -o $@
 
 # the library drop for other programs: the shared library, its headers and the CLI
 dist: build/libsam.$(SOEXT) build/sam
